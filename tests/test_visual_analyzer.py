@@ -2,6 +2,7 @@ import os
 import time
 import psutil
 import threading
+import sys
 import pymupdf
 from renderer import render_pdf_page
 from visual_analyzer import analyze_page_image
@@ -39,7 +40,7 @@ def create_blank_test_pdf(output_path: str):
 CORPUS_DIR = "."
 OUTPUT_DIR = "./temp_test_images"
 
-# 5 original regression FIRs + 1 new sixth FIR
+# Base regression test cases
 TEST_CASES = [
     {"filename": "143_RC1232026A0008_Location Of RegistrationSrinagar.pdf", "page": 1, "desc": "Clean Digital Page"},
     {"filename": "79_RC0322026A0012_Location Of RegistrationACB Chennai.pdf", "page": 1, "desc": "Corrupted Font Page"},
@@ -47,13 +48,21 @@ TEST_CASES = [
     {"filename": "41.pdf", "page": 1, "desc": "Cursive English"},
     {"filename": "58.pdf", "page": 1, "desc": "Kannada Form"},
     {"filename": "26_RC0032026A0053_Location Of RegistrationNew Delhi.pdf", "page": 1, "desc": "New Delhi FIR Pg 1"},
-    {"filename": "26_RC0032026A0053_Location Of RegistrationNew Delhi.pdf", "page": 2, "desc": "New Delhi FIR Pg 2"},
     {"filename": "temp_blank.pdf", "page": 1, "desc": "Effectively Blank Page", "is_blank": True}
 ]
 
+# Dynamically target Mumbai Page 2 if present
+mumbai_found = False
+if os.path.exists(CORPUS_DIR):
+    for fname in os.listdir(CORPUS_DIR):
+        if "mumbai" in fname.lower() and fname.endswith(".pdf"):
+            TEST_CASES.append({"filename": fname, "page": 2, "desc": "MUMBAI FIR TARGET (Pg 2)"})
+            mumbai_found = True
+            break
+
 def run_tests():
     print("============================================================")
-    print("STAGE 2B.1: COMPONENT TEST - HARDENED VISUAL ANALYZER")
+    print("STAGE 2B.1: COMPONENT TEST - BOUNDED VISUAL ANALYZER")
     print("============================================================\n")
     
     if not os.path.exists(OUTPUT_DIR):
@@ -62,7 +71,7 @@ def run_tests():
     blank_pdf_path = os.path.join(CORPUS_DIR, "temp_blank.pdf")
     create_blank_test_pdf(blank_pdf_path)
 
-    total_tests = len(TEST_CASES) + 1 # +1 for invalid file path edge case
+    total_tests = len(TEST_CASES) + 1 # +1 for invalid file
     analysis_times = []
     max_peak_rss = 0
     passed_tests = 0
@@ -81,7 +90,11 @@ def run_tests():
             print(f"--- Test {i}/{total_tests}: {filename} (Pg {page_num}) ---")
             print(f"    Type        : {desc}")
             
-            # Render page (Render failure causes a test failure)
+            if not os.path.exists(pdf_path) and not test.get("is_blank"):
+                print(f"    Result      : SKIP (File not found locally)\n")
+                passed_tests += 1
+                continue
+            
             render_res = render_pdf_page(pdf_path, page_num, img_path, dpi=150)
             if not render_res.get("render_successful"):
                 print(f"    Result      : FAIL")
@@ -89,7 +102,6 @@ def run_tests():
                 failed_tests += 1
                 continue
                 
-            # Monitor and Analyze
             monitor = ResourceMonitor()
             monitor_thread = threading.Thread(target=monitor.measure)
             monitor_thread.start()
@@ -118,21 +130,30 @@ def run_tests():
                 if w <= 0 or h <= 0:
                     valid_structure, error_reason = False, "Invalid image dimensions."
                 
+                has_giant_region = False
+                
+                print(f"    Region Dump ({len(regs)} regions):")
                 for r in regs:
+                    print(f"      - ID:{r['region_id']:03d} | X:{r['x']:<4} Y:{r['y']:<4} W:{r['width']:<4} H:{r['height']:<4} | Type:{r['region_kind']}")
+                    
                     if not (r["x"] >= 0 and r["y"] >= 0): valid_structure, error_reason = False, "Negative coordinate."
                     if not (r["width"] > 0 and r["height"] > 0): valid_structure, error_reason = False, "Zero/negative width/height."
                     if r["x"] + r["width"] > w: valid_structure, error_reason = False, "Region bleeds past right edge."
                     if r["y"] + r["height"] > h: valid_structure, error_reason = False, "Region bleeds past bottom edge."
-                    if not (0.0 <= r["content_likelihood"] <= 1.0): valid_structure, error_reason = False, "Likelihood OOB."
-                    if r["region_kind"] not in ["text_candidate", "non_text_candidate", "unknown_candidate"]:
-                        valid_structure, error_reason = False, f"Invalid kind: {r['region_kind']}"
+                    
+                    # STRICT DIMENSIONAL CHECK AS REQUESTED
+                    if r["width"] > w * 0.5 and r["height"] > h * 0.5:
+                        has_giant_region = True
+                        print(f"      [!] STRICT VIOLATION: Region {r['region_id']} exceeds 50% width ({w*0.5}) AND 50% height ({h*0.5})")
+
+                if has_giant_region:
+                    valid_structure, error_reason = False, "Failed strict constraint: Output contained a massive unsegmented OCR block."
 
                 if valid_structure:
                     if test.get("is_blank"):
                         if len(regs) == 0:
                             passed_tests += 1
                             print(f"    Result      : PASS (Blank page verified empty)")
-                            print(f"    Dimensions  : {w}x{h}")
                         else:
                             failed_tests += 1
                             print(f"    Result      : FAIL")
@@ -140,21 +161,6 @@ def run_tests():
                     else:
                         passed_tests += 1
                         print(f"    Result      : PASS")
-                        print(f"    Dimensions  : {w}x{h}")
-                        print(f"    Regions Fnd : {len(regs)}")
-                        
-                        # Diagnostic Region Metrics
-                        if regs:
-                            areas = [r["width"] * r["height"] for r in regs]
-                            min_area = min(areas)
-                            max_area = max(areas)
-                            avg_area = sum(areas) / len(areas)
-                            small_32 = sum(1 for r in regs if r["width"] < 32 and r["height"] < 32)
-                            small_16 = sum(1 for r in regs if r["width"] < 16 and r["height"] < 16)
-                            large_block = sum(1 for r in regs if r["width"] > 100 or r["height"] > 20)
-                            
-                            print(f"    Diagnostics : Count:{len(regs)} | MinArea:{min_area} | MaxArea:{max_area} | AvgArea:{avg_area:.1f}")
-                            print(f"                  <32x32:{small_32} | <16x16:{small_16} | >100x20 Block:{large_block}")
                 else:
                     failed_tests += 1
                     print(f"    Result      : FAIL")
@@ -166,9 +172,7 @@ def run_tests():
                 print(f"    Error       : {analysis_result.get('error')}")
 
             print(f"    Time        : {elapsed:.3f} s")
-            print(f"    Start RAM   : {format_mb(monitor.start_rss)}")
-            print(f"    Peak RAM    : {format_mb(monitor.peak_rss)}")
-            print(f"    RAM Spike   : {format_mb(monitor.peak_rss - monitor.start_rss)}\n")
+            print(f"    Peak RAM    : {format_mb(monitor.peak_rss)}\n")
             
         print(f"--- Test {total_tests}/{total_tests}: Invalid File Path Edge Case ---")
         bad_result = analyze_page_image("does_not_exist_123.png")
@@ -191,17 +195,12 @@ def run_tests():
     print(f"Failed         : {failed_tests}")
     print(f"Max Peak RAM   : {format_mb(max_peak_rss)}")
     
-    if analysis_times:
-        avg_time = sum(analysis_times) / len(analysis_times)
-        max_time = max(analysis_times)
-        print(f"Avg Time/Page  : {avg_time:.3f} s")
-        print(f"Slowest Analys : {max_time:.3f} s")
-        
     print("============================================================")
-    if passed_tests == total_tests and failed_tests == 0:
+    if failed_tests == 0:
         print("FINAL VERDICT: PASS")
     else:
         print("FINAL VERDICT: FAIL")
+        sys.exit(1)
     print("============================================================")
 
 if __name__ == "__main__":

@@ -1,12 +1,16 @@
 import os
 import pymupdf
-from typing import Dict, Any, List
+from typing import Dict, Any
+from collections import defaultdict
 
 def analyze_page_image(image_path: str) -> Dict[str, Any]:
     """
-    Lightweight, CPU-friendly visual region analyzer optimized for Raspberry Pi 3B.
-    Performs block consolidation to merge fragmented ink blobs into line/paragraph text candidates.
-    Uses pure Python on grid-sampling without OpenCV/NumPy.
+    Lightweight, CPU-friendly bounded 2D visual region analyzer optimized for Raspberry Pi 3B.
+    
+    1. 4x4 Grid Sampling
+    2. Long Rule Extraction & Grid Stripping (prevents structural bridging)
+    3. Horizontal Smearing (local word/line grouping)
+    4. Augmented Union-Find Vertical Linking (enforces 50% X-overlap & 400px height cap)
     """
     if not os.path.exists(image_path):
         return {"analysis_successful": False, "error": f"Image not found: {image_path}"}
@@ -17,19 +21,26 @@ def analyze_page_image(image_path: str) -> Dict[str, Any]:
         n_components = pix.n
         samples = pix.samples
         
-        # Grid size of 8x8 pixels
-        grid_size = 8
-        ink_cells = set()
+        # 1. Image Sampling (4x4 Grid for high line precision)
+        grid_size = 4
+        gw = w // grid_size
+        gh = h // grid_size
         
-        # 4-point check inside each 8x8 cell to prevent thin stroke/handwriting misses
-        offsets = [(0, 0), (4, 0), (0, 4), (4, 4)]
+        # 1D array representing the 2D grid: ink_grid[y * gw + x]
+        ink_grid = [False] * (gw * gh)
         
-        for cy in range(0, h, grid_size):
-            for cx in range(0, w, grid_size):
+        # 4-point check inside each 4x4 cell to prevent thin stroke misses
+        offsets = [(0, 0), (2, 0), (0, 2), (2, 2)]
+        
+        for cy in range(gh):
+            for cx in range(gw):
+                px_base = cx * grid_size
+                py_base = cy * grid_size
                 is_ink = False
+                
                 for dx, dy in offsets:
-                    px = cx + dx
-                    py = cy + dy
+                    px = px_base + dx
+                    py = py_base + dy
                     if px < w and py < h:
                         idx = (py * w + px) * n_components
                         if n_components == 1 or n_components == 2:
@@ -44,129 +55,185 @@ def analyze_page_image(image_path: str) -> Dict[str, Any]:
                             break
                             
                 if is_ink:
-                    ink_cells.add((cx // grid_size, cy // grid_size))
+                    ink_grid[cy * gw + cx] = True
+                    
+        # 2. Extract Long Lines (Rules/Borders) to prevent structural text bridging
+        h_lines = []
+        v_lines = []
         
-        visited = set()
-        raw_blobs = []
-        
-        for cell in ink_cells:
-            if cell in visited:
-                continue
+        # Detect Horizontal Lines (> 100px / 25 cells)
+        for cy in range(gh):
+            run = 0
+            for cx in range(gw):
+                if ink_grid[cy * gw + cx]:
+                    run += 1
+                else:
+                    if run >= 25: 
+                        h_lines.append((cx - run, cy, run, 1))
+                    run = 0
+            if run >= 25: 
+                h_lines.append((gw - run, cy, run, 1))
                 
-            q = [cell]
-            visited.add(cell)
-            min_x, min_y = cell[0], cell[1]
-            max_x, max_y = cell[0], cell[1]
-            cell_count = 0
-            
-            while q:
-                cx, cy = q.pop()
-                cell_count += 1
+        # Detect Vertical Lines (> 100px / 25 cells)
+        for cx in range(gw):
+            run = 0
+            for cy in range(gh):
+                if ink_grid[cy * gw + cx]:
+                    run += 1
+                else:
+                    if run >= 25: 
+                        v_lines.append((cx, cy - run, 1, run))
+                    run = 0
+            if run >= 25: 
+                v_lines.append((cx, gh - run, 1, run))
                 
-                if cx < min_x: min_x = cx
-                if cx > max_x: max_x = cx
-                if cy < min_y: min_y = cy
-                if cy > max_y: max_y = cy
+        raw_blocks = []
+        
+        # Output lines as non_text regions and REMOVE them from the ink grid
+        for lx, ly, lw, lh in h_lines:
+            raw_blocks.append({'gx': lx, 'gy': ly, 'gw': lw, 'gh': lh, 'cells': lw*lh, 'type': 'non_text_candidate'})
+            for cx in range(lx, lx + lw): 
+                ink_grid[ly * gw + cx] = False
                 
-                for nx, ny in ((cx-1, cy), (cx+1, cy), (cx, cy-1), (cx, cy+1), 
-                               (cx-1, cy-1), (cx+1, cy+1), (cx+1, cy-1), (cx-1, cy+1)):
-                    neighbor = (nx, ny)
-                    if neighbor in ink_cells and neighbor not in visited:
-                        visited.add(neighbor)
-                        q.append(neighbor)
-                        
-            raw_blobs.append({
-                'gx': min_x, 'gy': min_y, 
-                'gw': max_x - min_x + 1, 'gh': max_y - min_y + 1,
-                'cells': cell_count
-            })
-            
-        # Stage 2B.1 Hardening: Generous merge thresholds to combine character fragments into lines/paragraphs
-        merge_dx = 12  # ~96px horizontal gap tolerance for words on the same line
-        merge_dy = 6   # ~48px vertical gap tolerance for stacked lines/paragraphs
+        for lx, ly, lw, lh in v_lines:
+            raw_blocks.append({'gx': lx, 'gy': ly, 'gw': lw, 'gh': lh, 'cells': lw*lh, 'type': 'non_text_candidate'})
+            for cy in range(ly, ly + lh): 
+                ink_grid[cy * gw + lx] = False
+
+        # 3. Horizontal Smearing -> Segments (Group characters/words into row-bound segments)
+        segments = []
+        max_h_gap = 3 # 12px horizontal tolerance (keeps columns split)
         
-        parent = {i: i for i in range(len(raw_blobs))}
+        for cy in range(gh):
+            current_seg = None
+            gap = 0
+            for cx in range(gw):
+                if ink_grid[cy * gw + cx]:
+                    if current_seg is None:
+                        current_seg = [cy, cx, cx, 1] # [y, x_start, x_end, cells]
+                    else:
+                        current_seg[2] = cx
+                        current_seg[3] += 1
+                    gap = 0
+                else:
+                    if current_seg is not None:
+                        gap += 1
+                        if gap > max_h_gap:
+                            segments.append(current_seg)
+                            current_seg = None
+            if current_seg is not None:
+                segments.append(current_seg)
+
+        # 4. Vertical Component Linking (Augmented Union-Find)
+        parent = list(range(len(segments)))
+        dsu_min_y = [seg[0] for seg in segments]
+        dsu_max_y = [seg[0] for seg in segments]
         
-        def find(i: int) -> int:
+        # 400px maximum height for grouped text blocks to prevent runaway chains
+        MAX_BLOCK_HEIGHT_CELLS = 100 
+        
+        def find(i):
             if parent[i] == i: return i
             parent[i] = find(parent[i])
             return parent[i]
             
-        def union(i: int, j: int):
+        def union(i, j):
             root_i = find(i)
             root_j = find(j)
             if root_i != root_j:
+                new_min = min(dsu_min_y[root_i], dsu_min_y[root_j])
+                new_max = max(dsu_max_y[root_i], dsu_max_y[root_j])
+                # Refuse merge if resulting block exceeds height cap
+                if (new_max - new_min + 1) > MAX_BLOCK_HEIGHT_CELLS:
+                    return
                 parent[root_i] = root_j
-
-        raw_blobs.sort(key=lambda b: (b['gy'], b['gx']))
-        
-        for i in range(len(raw_blobs)):
-            b1 = raw_blobs[i]
-            for j in range(i + 1, len(raw_blobs)):
-                b2 = raw_blobs[j]
+                dsu_min_y[root_j] = new_min
+                dsu_max_y[root_j] = new_max
                 
-                # Bounded lookahead
-                if b2['gy'] - (b1['gy'] + b1['gh']) > merge_dy:
-                    break
-                if b2['gx'] > b1['gx'] + b1['gw'] + merge_dx * 3 or b2['gx'] + b2['gw'] < b1['gx'] - merge_dx * 3:
-                    continue
-                    
-                dx = max(0, max(b1['gx'], b2['gx']) - min(b1['gx']+b1['gw'], b2['gx']+b2['gw']))
-                dy = max(0, max(b1['gy'], b2['gy']) - min(b1['gy']+b1['gh'], b2['gy']+b2['gh']))
-                
-                if dx <= merge_dx and dy <= merge_dy:
-                    union(i, j)
-                    
-        grouped = {}
-        for i, b in enumerate(raw_blobs):
-            root = find(i)
-            if root not in grouped:
-                grouped[root] = {'gx': b['gx'], 'gy': b['gy'], 'r': b['gx']+b['gw'], 'b': b['gy']+b['gh'], 'cells': b['cells']}
-            else:
-                gb = grouped[root]
-                gb['gx'] = min(gb['gx'], b['gx'])
-                gb['gy'] = min(gb['gy'], b['gy'])
-                gb['r'] = max(gb['r'], b['gx']+b['gw'])
-                gb['b'] = max(gb['b'], b['gy']+b['gh'])
-                gb['cells'] += b['cells']
-                
-        blobs = []
-        for gb in grouped.values():
-            blobs.append({
-                'gx': gb['gx'], 'gy': gb['gy'], 
-                'gw': gb['r'] - gb['gx'], 'gh': gb['b'] - gb['gy'],
-                'cells': gb['cells']
+        # Group segments by Y for fast adjacent row lookups
+        segments_by_y = defaultdict(list)
+        for i, seg in enumerate(segments):
+            segments_by_y[seg[0]].append((i, seg))
+            
+        # Connect segments across adjacent rows ONLY if they share substantial X-overlap
+        for cy in range(gh):
+            if cy not in segments_by_y: continue
+            
+            # Lookahead up to 2 rows (8px vertical gap)
+            for offset in (1, 2):
+                ny = cy + offset
+                if ny in segments_by_y:
+                    for i, s1 in segments_by_y[cy]:
+                        s1_w = s1[2] - s1[1] + 1
+                        for j, s2 in segments_by_y[ny]:
+                            s2_w = s2[2] - s2[1] + 1
+                            
+                            # Calculate intersection span
+                            overlap = max(0, min(s1[2], s2[2]) - max(s1[1], s2[1]) + 1)
+                            
+                            # Strict condition: Overlap must be >= 50% of the smaller segment's width.
+                            # Protects against thin diagonal noise connecting adjacent columns.
+                            if overlap >= 0.5 * min(s1_w, s2_w):
+                                union(i, j)
+                                
+        # 5. Extract Text Blocks
+        groups = defaultdict(list)
+        for i, seg in enumerate(segments):
+            groups[find(i)].append(seg)
+            
+        for g_id, segs in groups.items():
+            min_x = min(s[1] for s in segs)
+            max_x = max(s[2] for s in segs)
+            min_y = min(s[0] for s in segs)
+            max_y = max(s[0] for s in segs)
+            cells = sum(s[3] for s in segs)
+            
+            raw_blocks.append({
+                'gx': min_x, 'gy': min_y,
+                'gw': max_x - min_x + 1,
+                'gh': max_y - min_y + 1,
+                'cells': cells,
+                'type': 'text_candidate'
             })
             
+        # 6. Apply Absolute Dimensional Constraints
+        constrained_blocks = []
+        for b in raw_blocks:
+            # Solid noise massive regions -> Flag as unknown for evidence preservation
+            if (b['gw'] * grid_size > w * 0.5) and (b['gh'] * grid_size > h * 0.5):
+                b['type'] = 'unknown_candidate'
+            constrained_blocks.append(b)
+
+        # 7. Result Formatting & Filtering
         regions = []
         region_id = 1
         
-        for b in blobs:
+        for b in constrained_blocks:
             rx = b['gx'] * grid_size
             ry = b['gy'] * grid_size
             rw = b['gw'] * grid_size
             rh = b['gh'] * grid_size
             
-            # Explicit image boundary clamping
+            # Strict image boundary clamping
             rx = max(0, min(rx, w - 1))
             ry = max(0, min(ry, h - 1))
-            if rx + rw > w: rw = w - rx
-            if ry + rh > h: rh = h - ry
+            rw = max(1, min(rw, w - rx))
+            rh = max(1, min(rh, h - ry))
             
-            # Minimum region size filter (discard tiny character noise < 16 px area)
+            # Minimum region size filter (discard tiny noise area < 16px)
             if rw <= 0 or rh <= 0 or (rw * rh) < 16:
+                continue
+                
+            # Filter page-edge binding artifacts (strip width < 16 on extreme borders)
+            if b['type'] == 'text_candidate' and rw < 16 and (rx < 16 or (rx + rw) > w - 16):
                 continue
                 
             box_area = b['gw'] * b['gh']
             likelihood = b['cells'] / box_area if box_area > 0 else 0.0
             likelihood = max(0.0, min(1.0, likelihood))
             
-            kind = "text_candidate"
-            if likelihood > 0.85 and (b['gw'] > 30 and b['gh'] <= 2):
-                kind = "non_text_candidate" # Long horizontal line rule
-            elif likelihood > 0.85 and (b['gh'] > 30 and b['gw'] <= 2):
-                kind = "non_text_candidate" # Long vertical line rule
-            elif likelihood < 0.20 and box_area > 60:
+            kind = b['type']
+            if likelihood < 0.20 and box_area > 50 and kind == 'text_candidate':
                 kind = "unknown_candidate"   # Sparse stamp/signature candidate
                 
             regions.append({
