@@ -1,0 +1,47 @@
+# =========================
+# Python virtual environment
+# =========================
+api-env/
+venv/
+env/
+.venv/
+
+# =========================
+# Python cache
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+
+# =========================
+# Generated OCR/output files
+# =========================
+output.txt
+output_preprocessed.txt
+output_psm6.txt
+preprocessed.png
+
+# =========================
+# Temporary/test data
+# =========================
+temp_test_images/
+test_renders/
+
+# =========================
+# Environment/secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# IDE/editor
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
